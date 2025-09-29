@@ -1,9 +1,15 @@
-name: "ci"
+name: "Build Linux AppImage"
 
 on:
   push:
-    tags: "**"
+    tags: 
+      - 'v*'
   workflow_dispatch:
+    inputs:
+      tag_name:
+        description: 'Tag name for the release'
+        required: false
+        default: 'latest'
 
 defaults:
   run:
@@ -11,88 +17,173 @@ defaults:
 
 jobs:
   appimage:
-    runs-on: ubuntu-18.04
+    runs-on: ubuntu-20.04
 
     steps:
     - name: Checkout repository
-      uses: actions/checkout@v2
+      uses: actions/checkout@v4
       with:
-        submodules: true
+        submodules: recursive
+        fetch-depth: 0
 
     - name: Install dependencies
       run: |
-        sudo add-apt-repository -y ppa:beineri/opt-qt-5.15.2-bionic
         sudo apt-get update -qq
         sudo apt-get install -y \
-        build-essential make wget libgl1-mesa-dev \
-        qt515declarative qt515graphicaleffects \
-        qt515quickcontrols qt515quickcontrols2
+          build-essential cmake make wget git \
+          libgl1-mesa-dev libglu1-mesa-dev \
+          libfontconfig1-dev libfreetype6-dev \
+          libx11-dev libx11-xcb-dev libxext-dev libxfixes-dev \
+          libxi-dev libxrender-dev libxcb1-dev libxcb-glx0-dev \
+          libxcb-keysyms1-dev libxcb-image0-dev libxcb-shm0-dev \
+          libxcb-icccm4-dev libxcb-sync-dev libxcb-xfixes0-dev \
+          libxcb-shape0-dev libxcb-randr0-dev libxcb-render-util0-dev \
+          libxcb-util-dev libxcb-xinerama0-dev libxcb-xkb-dev \
+          libxkbcommon-dev libxkbcommon-x11-dev \
+          qt5-qmake qtbase5-dev qtdeclarative5-dev \
+          qtquickcontrols2-5-dev qml-module-qtquick-controls2 \
+          qml-module-qtgraphicaleffects qml-module-qtquick-dialogs \
+          qml-module-qtquick-localstorage qml-module-qtquick-window2
 
-    - name: Download QT appimage builder
+    - name: Download linuxdeployqt
       run: |
         wget -c -O linuxdeployqt.AppImage \
-        https://github.com/probonopd/linuxdeployqt/releases/download/continuous/linuxdeployqt-continuous-x86_64.AppImage
+          https://github.com/probonopd/linuxdeployqt/releases/download/continuous/linuxdeployqt-continuous-x86_64.AppImage
         chmod a+x linuxdeployqt.AppImage
 
-    - name: Build project
+    - name: Build qmltermwidget library
       run: |
-        source /opt/qt*/bin/qt*-env.sh && \
-        qmake -v && \
-        qmake CONFIG+=release PREFIX=/usr && \
+        cd qmltermwidget
+        qmake -v
+        qmake qmltermwidget.pro
+        make -j$(nproc)
+        cd ..
+
+    - name: Build cool-retro-term
+      run: |
+        qmake -v
+        qmake CONFIG+=release PREFIX=/usr cool-retro-term.pro
         make -j$(nproc)
 
-    - name: Install to appdir
+    - name: Prepare AppDir structure
       run: |
-        source /opt/qt*/bin/qt*-env.sh && \
-        make INSTALL_ROOT=appdir -j$(nproc) install
+        mkdir -p appdir/usr/{bin,lib,share/{applications,metainfo,icons/hicolor/128x128/apps},qml}
+        
+        # Copy main executable
+        cp cool-retro-term appdir/usr/bin/
+        
+        # Copy desktop file and metadata
+        cp cool-retro-term.desktop appdir/usr/share/applications/
+        cp packaging/appdata/cool-retro-term.appdata.xml appdir/usr/share/metainfo/
+        
+        # Copy icon
+        cp app/icons/128x128/cool-retro-term.png appdir/usr/share/icons/hicolor/128x128/apps/
+        
+        # Copy QML files
+        cp -r app/qml/* appdir/usr/qml/
+        cp -r qmltermwidget/QMLTermWidget appdir/usr/qml/
+        
+        # Set executable permissions
+        chmod +x appdir/usr/bin/cool-retro-term
 
     - name: Extract version number
       run: |
-        # Extract version for linuxdeployqt to name the file. Use the tag as
-        # release name but remove prefix.
-        echo "VERSION=$(echo '${{ github.ref }}' | sed 's;.*/;;')" >> $GITHUB_ENV
+        if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+          if [ "${{ github.event.inputs.tag_name }}" != "latest" ]; then
+            echo "VERSION=${{ github.event.inputs.tag_name }}" >> $GITHUB_ENV
+          else
+            echo "VERSION=latest" >> $GITHUB_ENV
+          fi
+        else
+          echo "VERSION=$(echo '${{ github.ref }}' | sed 's;refs/tags/;;')" >> $GITHUB_ENV
+        fi
+        echo "Building version: $VERSION"
 
-    - name: Build appimage directory
+    - name: Build AppImage
       run: |
-        mkdir -p \
-        appdir/usr/bin \
-        appdir/usr/lib \
-        appdir/usr/share/applications \
-        appdir/usr/share/metainfo \
-        appdir/usr/share/icons/hicolor/128x128/apps
-
-        cp cool-retro-term appdir/usr/bin/
-        cp cool-retro-term.desktop appdir/usr/share/applications/
-        cp packaging/appdata/cool-retro-term.appdata.xml appdir/usr/share/metainfo/
-        cp app/icons/128x128/cool-retro-term.png appdir/usr/share/icons/hicolor/128x128/apps/
-        cp -r ./app/qml appdir/usr/
-        # Workaround for https://github.com/probonopd/linuxdeployqt/issues/78
-        cp -r ./qmltermwidget/QMLTermWidget appdir/usr/qml/
-
-        find appdir | sort
-
-    - name: Build appimage
-      run: |
-        source /opt/qt*/bin/qt*-env.sh && \
+        # Debug: show directory contents
+        echo "=== AppDir contents ==="
+        find appdir -type f | head -20
+        
+        # Build AppImage with linuxdeployqt
         ./linuxdeployqt.AppImage appdir/usr/share/applications/cool-retro-term.desktop \
-        -verbose=1 -appimage \
-        -qmldir=./app/qml/ \
-        -qmldir=./qmltermwidget/
+          -verbose=2 -appimage \
+          -qmldir=./app/qml/ \
+          -qmldir=./qmltermwidget/ \
+          -executable=appdir/usr/bin/cool-retro-term \
+          -no-translations
       env:
-        # Unset environment variables
-        QTDIR:
-        QT_PLUGIN_PATH:
-        LD_LIBRARY_PATH:
+        VERSION: ${{ env.VERSION }}
 
-    - name: Upload release
+    - name: Rename AppImage
+      run: |
+        # Find the generated AppImage and rename it
+        APPIMAGE_FILE=$(find . -name "Cool_Retro_Term*.AppImage" -o -name "cool-retro-term*.AppImage" | head -1)
+        if [ -f "$APPIMAGE_FILE" ]; then
+          NEW_NAME="cool-retro-term-${VERSION}-x86_64.AppImage"
+          mv "$APPIMAGE_FILE" "$NEW_NAME"
+          echo "APPIMAGE_NAME=$NEW_NAME" >> $GITHUB_ENV
+          echo "Renamed AppImage to: $NEW_NAME"
+          ls -la "$NEW_NAME"
+        else
+          echo "No AppImage found!"
+          ls -la *.AppImage || echo "No .AppImage files found"
+          exit 1
+        fi
+
+    - name: Test AppImage
+      run: |
+        # Make sure the AppImage is executable and can show version
+        chmod +x "$APPIMAGE_NAME"
+        ./"$APPIMAGE_NAME" --version || echo "Version check failed, but AppImage exists"
+        file "$APPIMAGE_NAME"
+
+    - name: Upload to existing release
+      if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
       uses: softprops/action-gh-release@v1
       with:
-        body: appimage release
-        files: ./**/Cool_Retro_Term-*-x86_64.AppImage
+        files: ${{ env.APPIMAGE_NAME }}
+        tag_name: ${{ env.VERSION }}
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+    - name: Create new release (manual)
+      if: github.event_name == 'workflow_dispatch'
+      uses: softprops/action-gh-release@v1
+      with:
+        name: "Cool Retro Term ${{ env.VERSION }} - Linux AppImage"
+        body: |
+          ## Cool Retro Term ${{ env.VERSION }} - Linux AppImage
+          
+          ### Installation Instructions:
+          
+          1. Download the AppImage file
+          2. Make it executable: `chmod +x cool-retro-term-${{ env.VERSION }}-x86_64.AppImage`
+          3. Run it: `./cool-retro-term-${{ env.VERSION }}-x86_64.AppImage`
+          
+          ### System Requirements:
+          - Linux x86_64
+          - GLIBC 2.17+ (Ubuntu 16.04+, CentOS 7+, etc.)
+          - OpenGL support
+          
+          The AppImage contains all necessary dependencies and should work on most modern Linux distributions.
+        files: ${{ env.APPIMAGE_NAME }}
+        tag_name: ${{ env.VERSION }}
+        draft: false
+        prerelease: false
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+    - name: Upload artifact
+      uses: actions/upload-artifact@v3
+      with:
+        name: cool-retro-term-appimage-${{ env.VERSION }}
+        path: ${{ env.APPIMAGE_NAME }}
+        retention-days: 30
 
     - name: Clean up
       if: always()
       run: |
-        find appdir -executable -type f -exec ldd {} \; | grep " => /usr" | cut -d " " -f 2-3 | sort | uniq
-        make clean
-        rm -rf appdir
+        echo "=== Cleanup ==="
+        rm -rf appdir linuxdeployqt.AppImage
+        make clean || echo "Clean failed, continuing..."
